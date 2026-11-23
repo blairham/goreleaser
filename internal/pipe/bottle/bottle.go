@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"path"
@@ -142,11 +143,14 @@ func buildBottles(ctx *context.Context, cfg config.HomebrewBottle) error {
 
 	files := make([]config.HomebrewBottleFile, 0, len(cfg.Bottles.Files))
 	for _, f := range cfg.Bottles.Files {
+		if (f.Src == "") == (f.Link == "") {
+			return fmt.Errorf("bottles.files %q: set exactly one of src and link", f.Dst)
+		}
 		src, err := tmpl.New(ctx).Apply(f.Src)
 		if err != nil {
 			return err
 		}
-		files = append(files, config.HomebrewBottleFile{Src: src, Dst: f.Dst})
+		files = append(files, config.HomebrewBottleFile{Src: src, Dst: f.Dst, Link: f.Link})
 	}
 
 	dir := filepath.Join(ctx.Config.Dist, "homebrew_bottles")
@@ -158,7 +162,11 @@ func buildBottles(ctx *context.Context, cfg config.HomebrewBottle) error {
 		filename := bottleFilename(cfg.Name, ctx.Version, tag)
 		dst := filepath.Join(dir, filename)
 		log.WithField("bottle", dst).Info("creating")
-		if err := writeBottle(dst, cfg.Name, ctx.Version, ctx.Git.CommitDate, byTag[tag], files); err != nil {
+		entries, err := bottleEntries(cfg, byTag[tag], files)
+		if err != nil {
+			return fmt.Errorf("could not create %s: %w", filename, err)
+		}
+		if err := writeBottle(dst, path.Join(cfg.Name, ctx.Version), ctx.Git.CommitDate, entries); err != nil {
 			return fmt.Errorf("could not create %s: %w", filename, err)
 		}
 		ctx.Artifacts.Add(&artifact.Artifact{
@@ -175,9 +183,72 @@ func buildBottles(ctx *context.Context, cfg config.HomebrewBottle) error {
 	return nil
 }
 
-// writeBottle writes a bottle tarball laid out as Homebrew expects:
-// <name>/<version>/bin/<binary>, plus any extra files under the keg.
-func writeBottle(dst, name, version string, mtime time.Time, bins []*artifact.Artifact, files []config.HomebrewBottleFile) (err error) {
+// binaryDst is where a binary goes in the keg: bottles.binaries, else bin/.
+func binaryDst(cfg config.HomebrewBottle, name string) string {
+	for _, b := range cfg.Bottles.Binaries {
+		if b.Name == name && b.Dst != "" {
+			return path.Clean(b.Dst)
+		}
+	}
+	return path.Join("bin", name)
+}
+
+// entry is one thing in a bottle, relative to the keg.
+type entry struct {
+	src  string // file to copy; empty for a symlink
+	dst  string
+	link string // symlink target
+	exec bool   // force 0755 (binaries)
+}
+
+func bottleEntries(cfg config.HomebrewBottle, bins []*artifact.Artifact, files []config.HomebrewBottleFile) ([]entry, error) {
+	var entries []entry
+	for _, bin := range bins {
+		entries = append(entries, entry{src: bin.Path, dst: binaryDst(cfg, bin.Name), exec: true})
+	}
+	for _, f := range files {
+		dst := path.Clean(f.Dst)
+		if f.Link != "" {
+			entries = append(entries, entry{dst: dst, link: f.Link})
+			continue
+		}
+		info, err := os.Stat(f.Src)
+		if err != nil {
+			return nil, err
+		}
+		if !info.IsDir() {
+			entries = append(entries, entry{src: f.Src, dst: dst})
+			continue
+		}
+		var walked []entry
+		if err := filepath.WalkDir(f.Src, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return err
+			}
+			rel, err := filepath.Rel(f.Src, p)
+			if err != nil {
+				return err
+			}
+			walked = append(walked, entry{src: p, dst: path.Join(dst, filepath.ToSlash(rel))})
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		entries = append(entries, walked...)
+	}
+	seen := map[string]bool{}
+	for _, e := range entries {
+		if seen[e.dst] {
+			return nil, fmt.Errorf("%s is in the bottle twice", e.dst)
+		}
+		seen[e.dst] = true
+	}
+	return entries, nil
+}
+
+// writeBottle writes a bottle tarball laid out as Homebrew expects: every
+// entry under <name>/<version>/, with its parent directories.
+func writeBottle(dst, keg string, mtime time.Time, entries []entry) (err error) {
 	f, err := os.Create(dst)
 	if err != nil {
 		return err
@@ -186,23 +257,14 @@ func writeBottle(dst, name, version string, mtime time.Time, bins []*artifact.Ar
 
 	gw := gzip.NewWriter(f)
 	tw := tar.NewWriter(gw)
-	keg := path.Join(name, version)
 
-	type entry struct{ src, dst string }
-	var entries []entry
-	for _, bin := range bins {
-		entries = append(entries, entry{bin.Path, path.Join(keg, "bin", bin.Name)})
-	}
-	for _, file := range files {
-		entries = append(entries, entry{file.Src, path.Join(keg, path.Clean(file.Dst))})
-	}
-	seen := map[string]bool{}
+	dirs := map[string]bool{}
 	for _, e := range entries {
-		for d := path.Dir(e.dst); d != "." && !seen[d]; d = path.Dir(d) {
-			seen[d] = true
+		for d := path.Dir(path.Join(keg, e.dst)); d != "." && !dirs[d]; d = path.Dir(d) {
+			dirs[d] = true
 		}
 	}
-	for _, d := range slices.Sorted(maps.Keys(seen)) {
+	for _, d := range slices.Sorted(maps.Keys(dirs)) {
 		if err := tw.WriteHeader(&tar.Header{
 			Typeflag: tar.TypeDir,
 			Name:     d + "/",
@@ -213,7 +275,20 @@ func writeBottle(dst, name, version string, mtime time.Time, bins []*artifact.Ar
 		}
 	}
 	for _, e := range entries {
-		if err := addFile(tw, e.src, e.dst, mtime); err != nil {
+		name := path.Join(keg, e.dst)
+		if e.link != "" {
+			if err := tw.WriteHeader(&tar.Header{
+				Typeflag: tar.TypeSymlink,
+				Name:     name,
+				Linkname: e.link,
+				Mode:     0o777,
+				ModTime:  mtime,
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := addFile(tw, e.src, name, e.exec, mtime); err != nil {
 			return err
 		}
 	}
@@ -223,7 +298,7 @@ func writeBottle(dst, name, version string, mtime time.Time, bins []*artifact.Ar
 	return gw.Close()
 }
 
-func addFile(tw *tar.Writer, src, dst string, mtime time.Time) error {
+func addFile(tw *tar.Writer, src, dst string, exec bool, mtime time.Time) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -234,7 +309,7 @@ func addFile(tw *tar.Writer, src, dst string, mtime time.Time) error {
 		return err
 	}
 	mode := int64(0o644)
-	if info.Mode()&0o111 != 0 || path.Base(path.Dir(dst)) == "bin" {
+	if exec || info.Mode()&0o111 != 0 {
 		mode = 0o755
 	}
 	if err := tw.WriteHeader(&tar.Header{

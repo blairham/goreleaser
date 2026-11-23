@@ -19,6 +19,7 @@ import (
 	"github.com/goreleaser/goreleaser/v2/internal/artifact"
 	"github.com/goreleaser/goreleaser/v2/internal/client"
 	"github.com/goreleaser/goreleaser/v2/internal/commitauthor"
+	"github.com/goreleaser/goreleaser/v2/internal/git"
 	"github.com/goreleaser/goreleaser/v2/internal/pipe"
 	"github.com/goreleaser/goreleaser/v2/internal/skips"
 	"github.com/goreleaser/goreleaser/v2/internal/summary"
@@ -311,18 +312,76 @@ func installFor(ctx *context.Context, cfg config.HomebrewBottle) ([]string, erro
 	}
 	var lines []string
 	for _, name := range names {
-		l, err := goBuildLines(ctx, byName[name])
+		l, err := goBuildLines(ctx, byName[name], binaryDst(cfg, name))
 		if err != nil {
 			return nil, err
 		}
 		lines = append(lines, l...)
 	}
+	files, err := fileInstallLines(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	lines = append(lines, files...)
 	return append(lines, split(extra)...), nil
+}
+
+// isTracked reports whether git tracks src, i.e. whether it is in the source
+// archive the formula builds from. A variable so tests can stub it.
+var isTracked = func(ctx *context.Context, src string) bool {
+	out, err := git.Run(ctx, "ls-files", "--", src)
+	return err == nil && strings.TrimSpace(out) != ""
+}
+
+// fileInstallLines makes the source build lay out bottles.files like the
+// bottle does: symlinks always, and files or directories that are in the
+// source archive. Anything else (generated during the release) is left to
+// extra_install.
+func fileInstallLines(ctx *context.Context, cfg config.HomebrewBottle) ([]string, error) {
+	var lines []string
+	for _, f := range cfg.Bottles.Files {
+		dst := path.Clean(f.Dst)
+		dir, base := rubyKegDir(path.Dir(dst)), path.Base(dst)
+		if f.Link != "" {
+			lines = append(lines, fmt.Sprintf("%s.install_symlink %s => %s", dir, rubyQuote(f.Link), rubyQuote(base)))
+			continue
+		}
+		src, err := tmpl.New(ctx).Apply(f.Src)
+		if err != nil {
+			return nil, err
+		}
+		if filepath.IsAbs(src) || !isTracked(ctx, src) {
+			log.WithField("src", src).Debug("not in the source archive; the source build skips it")
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s.install %s => %s", dir, rubyQuote(filepath.ToSlash(src)), rubyQuote(base)))
+	}
+	return lines, nil
+}
+
+// rubyKegDir is a keg-relative directory as a Ruby Pathname expression.
+func rubyKegDir(dir string) string {
+	switch dir {
+	case "bin", "libexec", "sbin", "lib", "include", "share", "etc":
+		return dir
+	case ".":
+		return "prefix"
+	}
+	return "(prefix/" + rubyQuote(dir) + ")"
+}
+
+// rubyKegPath is a keg-relative path as a Ruby Pathname expression.
+func rubyKegPath(p string) string {
+	dir := rubyKegDir(path.Dir(p))
+	if !strings.HasPrefix(dir, "(") && dir != "prefix" {
+		return dir + "/" + rubyQuote(path.Base(p))
+	}
+	return "prefix/" + rubyQuote(p)
 }
 
 // goBuildLines returns the go build for one binary name. bins are that
 // binary's artifacts for every bottled target, all from the same build.
-func goBuildLines(ctx *context.Context, bins []*artifact.Artifact) ([]string, error) {
+func goBuildLines(ctx *context.Context, bins []*artifact.Artifact, dst string) ([]string, error) {
 	bin := bins[0]
 	id := artifact.ExtraOr(*bin, artifact.ExtraID, "")
 	idx := slices.IndexFunc(ctx.Config.Builds, func(b config.Build) bool { return b.ID == id })
@@ -353,7 +412,7 @@ func goBuildLines(ctx *context.Context, bins []*artifact.Artifact) ([]string, er
 		main = "./" + main
 	}
 
-	args := []string{fmt.Sprintf("output: bin/%s", rubyQuote(bin.Name))}
+	args := []string{"output: " + rubyKegPath(dst)}
 	if ldflags != "" {
 		args = append([]string{"ldflags: " + rubyQuote(ldflags)}, args...)
 	}

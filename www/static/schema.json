@@ -1885,9 +1885,9 @@
 				"additionalProperties": false,
 				"type": "object"
 			},
-			"HomebrewBottleFile": {
+			"HomebrewBottleBinary": {
 				"properties": {
-					"src": {
+					"name": {
 						"type": "string"
 					},
 					"dst": {
@@ -1897,7 +1897,25 @@
 				"additionalProperties": false,
 				"type": "object",
 				"required": [
-					"src",
+					"name",
+					"dst"
+				]
+			},
+			"HomebrewBottleFile": {
+				"properties": {
+					"src": {
+						"type": "string"
+					},
+					"dst": {
+						"type": "string"
+					},
+					"link": {
+						"type": "string"
+					}
+				},
+				"additionalProperties": false,
+				"type": "object",
+				"required": [
 					"dst"
 				]
 			},
@@ -1905,6 +1923,12 @@
 				"properties": {
 					"macos": {
 						"type": "string"
+					},
+					"binaries": {
+						"items": {
+							"$ref": "#/$defs/HomebrewBottleBinary"
+						},
+						"type": "array"
 					},
 					"files": {
 						"items": {

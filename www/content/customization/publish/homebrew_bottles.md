@@ -67,6 +67,35 @@ Bottles contain only what GoReleaser packs into them. Files you add with
 they are committed, so add the equivalent to `extra_install` for source
 builds, e.g. `generate_completions_from_executable(bin/"foo", "completion")`.
 
+## Keg layout
+
+Binaries go to `bin/` by default. `bottles.binaries` puts one somewhere else
+in the keg, for example a binary that must not shadow a system command on
+`PATH`:
+
+```yaml
+bottles:
+  binaries:
+    - name: bash
+      dst: libexec/bash
+```
+
+`bottles.files` adds files, whole directories or symlinks:
+
+```yaml
+bottles:
+  files:
+    - dst: bin/dm               # a second name for the binary
+      link: dockmaster
+    - src: share/sh/functions   # a directory, copied recursively
+      dst: share/sh/functions
+```
+
+The source build lays the keg out the same way: binaries are built to their
+`dst`, symlinks are recreated, and a `src` that git tracks (so it is in the
+source archive) is installed. A `src` generated during the release is only in
+the bottle; add its source-build equivalent to `extra_install`.
+
 ## Configuration
 
 ```yaml {filename=".goreleaser.yaml"}
@@ -111,10 +140,17 @@ homebrew_bottles:
       # Default: monterey.
       macos: monterey
 
-      # Extra files to pack into each bottle, relative to the keg.
+      # Where binaries go in the keg. Default: bin/<name>.
+      binaries:
+        - name: myproject
+          dst: bin/myproject
+
+      # Extra files, directories or symlinks, relative to the keg.
       files:
         - src: completions/myproject.zsh
           dst: share/zsh/site-functions/_myproject
+        - dst: bin/mp
+          link: myproject
 
     # Replaces the default `go build` install block (source builds only).
     install: |

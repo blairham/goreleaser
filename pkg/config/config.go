@@ -250,15 +250,32 @@ type HomebrewBottleSpec struct {
 	// MacOS is the oldest macOS codename the bottles are tagged for (e.g.
 	// monterey). Homebrew pours a bottle on that release and every newer one.
 	MacOS string `yaml:"macos,omitempty" json:"macos,omitempty"`
-	// Files are extra files to put in the bottle, relative to the keg.
+	// Binaries places binaries somewhere other than bin/ in the keg (e.g.
+	// libexec/), for the bottle and the source build alike.
+	Binaries []HomebrewBottleBinary `yaml:"binaries,omitempty" json:"binaries,omitempty"`
+	// Files are extra files, directories or symlinks to put in the bottle,
+	// relative to the keg.
 	Files []HomebrewBottleFile `yaml:"files,omitempty" json:"files,omitempty"`
 }
 
-// HomebrewBottleFile is an extra file packed into a bottle.
+// HomebrewBottleBinary sets where one binary goes in the keg.
+type HomebrewBottleBinary struct {
+	// Name is the binary's name.
+	Name string `yaml:"name" json:"name"`
+	// Dst is relative to the keg. Default: bin/<name>.
+	Dst string `yaml:"dst" json:"dst"`
+}
+
+// HomebrewBottleFile is an extra file, directory or symlink in a bottle.
 type HomebrewBottleFile struct {
-	Src string `yaml:"src" json:"src"`
+	// Src is a file or directory to copy. Templates: allowed. When git
+	// tracks it, the source build installs it too.
+	Src string `yaml:"src,omitempty" json:"src,omitempty"`
 	// Dst is relative to the keg, e.g. share/zsh/site-functions/_foo.
 	Dst string `yaml:"dst" json:"dst"`
+	// Link makes Dst a symlink to this path (relative to Dst's directory)
+	// instead of copying Src. The source build creates it too.
+	Link string `yaml:"link,omitempty" json:"link,omitempty"`
 }
 
 // HomebrewCask contains the homebrew_casks section.

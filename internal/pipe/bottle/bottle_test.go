@@ -282,15 +282,93 @@ func untar(t *testing.T, path string) map[string]string {
 			return out
 		}
 		require.NoError(t, err)
+		if h.Typeflag == tar.TypeSymlink {
+			out[h.Name] = "-> " + h.Linkname
+			continue
+		}
 		b, err := io.ReadAll(tr)
 		require.NoError(t, err)
 		if h.Typeflag == tar.TypeReg {
 			want := int64(0o644)
-			if filepath.Base(filepath.Dir(h.Name)) == "bin" {
+			if d := filepath.Base(filepath.Dir(h.Name)); d == "bin" || d == "libexec" {
 				want = 0o755
 			}
 			require.Equal(t, want, h.Mode, h.Name)
 		}
 		out[h.Name] = string(b)
+	}
+}
+
+func TestBottleLayout(t *testing.T) {
+	cfg := baseConfig()
+	share := filepath.Join(t.TempDir(), "functions")
+	require.NoError(t, os.MkdirAll(filepath.Join(share, "sub"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(share, "a"), []byte("a"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(share, "sub", "b"), []byte("b"), 0o644))
+	cfg.Bottles.Binaries = []config.HomebrewBottleBinary{{Name: "foo", Dst: "libexec/foo"}}
+	cfg.Bottles.Files = []config.HomebrewBottleFile{
+		{Dst: "bin/f", Link: "../libexec/foo"},
+		{Src: share, Dst: "share/foo/functions"},
+		{Src: "completions/_foo", Dst: "share/zsh/site-functions/_foo"},
+	}
+	ctx := setup(t, cfg, true)
+	// completions/_foo is not on disk here, so leave it out of the bottle
+	// but keep it to test the source-build side below.
+	bottleCfg := ctx.Config.HomebrewBottles[0]
+	bottleCfg.Bottles.Files = bottleCfg.Bottles.Files[:2]
+	ctx.Config.HomebrewBottles[0] = bottleCfg
+	require.NoError(t, Archive{}.Run(ctx))
+
+	b := ctx.Artifacts.Filter(artifact.ByType(artifact.HomebrewBottle)).List()[0]
+	files := untar(t, b.Path)
+	require.Contains(t, files, "foo/1.2.3/libexec/foo")
+	require.NotContains(t, files, "foo/1.2.3/bin/foo")
+	require.Equal(t, "a", files["foo/1.2.3/share/foo/functions/a"])
+	require.Equal(t, "b", files["foo/1.2.3/share/foo/functions/sub/b"])
+	require.Equal(t, "-> ../libexec/foo", files["foo/1.2.3/bin/f"])
+
+	orig := isTracked
+	t.Cleanup(func() { isTracked = orig })
+	isTracked = func(_ *context.Context, src string) bool { return src == "completions/_foo" }
+	formulaCfg := ctx.Config.HomebrewBottles[0]
+	formulaCfg.Bottles.Files = cfg.Bottles.Files
+	out, err := buildFormula(ctx, formulaCfg, client.NewMock())
+	require.NoError(t, err)
+	require.Contains(t, out, `output: libexec/"foo"`)
+	require.Contains(t, out, `bin.install_symlink "../libexec/foo" => "f"`)
+	require.Contains(t, out, `(prefix/"share/zsh/site-functions").install "completions/_foo" => "_foo"`)
+	// an absolute (untracked) source is left to extra_install.
+	require.NotContains(t, out, share)
+}
+
+func TestBottleFileNeedsSrcOrLink(t *testing.T) {
+	for name, f := range map[string]config.HomebrewBottleFile{
+		"neither": {Dst: "bin/x"},
+		"both":    {Dst: "bin/x", Src: "a", Link: "b"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := baseConfig()
+			cfg.Bottles.Files = []config.HomebrewBottleFile{f}
+			ctx := setup(t, cfg, true)
+			require.ErrorContains(t, Archive{}.Run(ctx), "exactly one of src and link")
+		})
+	}
+}
+
+func TestBottleDuplicateDst(t *testing.T) {
+	cfg := baseConfig()
+	cfg.Bottles.Files = []config.HomebrewBottleFile{{Dst: "bin/foo", Link: "x"}}
+	ctx := setup(t, cfg, true)
+	require.ErrorContains(t, Archive{}.Run(ctx), "bin/foo is in the bottle twice")
+}
+
+func TestRubyKegPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"bin/foo":            `bin/"foo"`,
+		"libexec/sh":         `libexec/"sh"`,
+		"share/sh/functions": `prefix/"share/sh/functions"`,
+		"foo":                `prefix/"foo"`,
+	} {
+		require.Equal(t, want, rubyKegPath(in), in)
 	}
 }
